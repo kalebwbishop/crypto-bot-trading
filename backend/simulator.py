@@ -1,267 +1,212 @@
-import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-from tqdm import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 import json
 import os
+from tqdm import tqdm
+from get_data import get_data
 
-# store the data
-data_file = "./BTC_USD.csv"
+def buy(usd_balance, btc_balance, price, fee_percent=0.005, real=False):
+    # Calculate fee amount
+    fee_amount = usd_balance * fee_percent
+    # Calculate how much BTC we can buy with our USD balance after fees
+    btc_to_buy = (usd_balance - fee_amount) / price
+    return 0, btc_balance + btc_to_buy
 
-# Read data from CSV
-df = pd.read_csv(data_file)
-dates = df.iloc[:, 0].values
-price_values = df.iloc[:, 1].values
+def sell(usd_balance, btc_balance, price, fee_percent=0.005, real=False):
+    # Calculate how much USD we get from selling our BTC
+    usd_from_sale = btc_balance * price
+    # Calculate fee amount
+    fee_amount = usd_from_sale * fee_percent
+    # Return USD balance after fees
+    return usd_balance + (usd_from_sale - fee_amount), 0
 
-def calculate_moving_averages(prices, window_sizes):
-    """Pre-calculate moving averages for all window sizes"""
-    if os.path.exists('moving_averages.json'):
-        with open('moving_averages.json', 'r') as f:
-            moving_averages = json.load(f)
-        return moving_averages
-
-    moving_averages = {}
-    for window_size in window_sizes:
-        # Use pandas rolling mean for efficient calculation
-        ma = pd.Series(prices).rolling(window=window_size, min_periods=1).mean().values
-        moving_averages[window_size] = ma
-
-    # with open('moving_averages.json', 'w') as f:
-    #     json.dump(moving_averages, f)
-    return moving_averages
-
-def calculate_weighted_moving_averages(prices, window_sizes):
-    """Pre-calculate weighted moving averages for all window sizes"""
-    if os.path.exists('weighted_moving_averages.json'):
-        with open('weighted_moving_averages.json', 'r') as f:
-            weighted_moving_averages = json.load(f)
-        return weighted_moving_averages
-
-    weighted_moving_averages = {}
-    for window_size in window_sizes:
-        # Create weights array
-        weights = np.arange(1, window_size + 1)
-        weights = weights / weights.sum()  # Normalize weights
-        
-        # Use pandas rolling with weights
-        weighted_ma = pd.Series(prices).rolling(
-            window=window_size,
-            min_periods=1
-        ).apply(lambda x: np.sum(x * weights[:len(x)]), raw=True).values
-        
-        weighted_moving_averages[window_size] = weighted_ma
-
-    with open('weighted_moving_averages.json', 'w') as f:
-        data_to_save = {}
-        for window_size in weighted_moving_averages:
-            data_to_save[window_size] = weighted_moving_averages[window_size].tolist()
-        json.dump(data_to_save, f)
-    return weighted_moving_averages
-
-def run_simulation(buy_percent, sell_percent, window_size, moving_averages, weighted_moving_averages, start_epoch, end_epoch):
-    """Optimized simulation function using vectorized operations"""
-
-    # Convert epochs to indices
-    start_idx = np.searchsorted(dates, start_epoch)
-    end_idx = np.searchsorted(dates, end_epoch)
+def simulate(usd_balance, btc_balance, start_date: datetime, end_date: datetime, buy_percent=0.98, sell_percent=1.02, floor=0.99, fee_percent=0.005, real=False, verbose=False):
+    # Load and preprocess data more efficiently
+    df = pd.read_csv('BTC_USD.csv', parse_dates=['datetime'])
+    df = df[(df['datetime'] >= start_date) & (df['datetime'] <= end_date)].copy()
     
-    # Slice data for the specified time period
-    dates_slice = dates[start_idx:end_idx]
-    prices_slice = price_values[start_idx:end_idx]
-    ma_slice = moving_averages[window_size][start_idx:end_idx]
-    weighted_ma_slice = weighted_moving_averages[str(10 * 3600 * 24)][start_idx:end_idx]
-    # Simulation parameters
-    initial_balance = 10000
+    # Pre-calculate moving averages and filter out NaN values
+    df['buy_price'] = df['moving_average_60'] * buy_percent
+    df['sell_price'] = df['moving_average_60'] * sell_percent
     
-    # Pre-calculate buy and sell prices
-    buy_prices = ma_slice * buy_percent
-    last_buy_price = 0
-    sell_prices = ma_slice * sell_percent
+    # Remove rows with NaN values
+    df = df.dropna(subset=['moving_average_60'])
     
     # Initialize arrays for tracking
-    portfolio_values = np.zeros_like(prices_slice)
-    btc_balance = np.zeros_like(prices_slice)
-    usd_balance = np.zeros_like(prices_slice)
-    usd_balance[0] = initial_balance
+    n = len(df)
+    portfolio_values = np.zeros(n)
+    btc_balances = np.zeros(n)
+    usd_balances = np.zeros(n)
+    total_fees = 0.0  # Track total fees paid
     
-    # Track trades
+    # Set initial values
+    usd_balances[0] = usd_balance
+    btc_balances[0] = btc_balance
+    portfolio_values[0] = usd_balance + (btc_balance * df.iloc[0]['close'])
+    
     trades = []
+    last_purchase_price = float('inf')
     
-    # Vectorized trading logic
-    for i in range(1, len(prices_slice)):
-        current_price = prices_slice[i]
-        current_date = dates_slice[i]
+    # Vectorized price arrays
+    prices = df['close'].values
+    buy_prices = df['buy_price'].values
+    sell_prices = df['sell_price'].values
+    dates = df['datetime'].values
+    
+    # Main simulation loop
+    for i in tqdm(range(1, n)):
+        current_price = prices[i]
+        current_date = dates[i]
         
         # Buy decision
-        if current_price <= buy_prices[i] and usd_balance[i-1] > 0:
-                btc_to_buy = usd_balance[i-1] / current_price
-                btc_balance[i] = btc_to_buy
-                usd_balance[i] = 0
-            
-                trades.append({
-                    'date': current_date,
-                    'type': 'BUY',
-                    'price': current_price,
-                    'amount': btc_to_buy,
-                    'value': usd_balance[i-1]
-                })
-        else:
-            btc_balance[i] = btc_balance[i-1]
-            usd_balance[i] = usd_balance[i-1]
-        
-        # Sell decision
-        if current_price >= sell_prices[i] and btc_balance[i] > 0:
-                usd_value = btc_balance[i] * current_price
-                usd_balance[i] += usd_value
-                btc_balance[i] = 0
-                
-                trades.append({
-                    'date': current_date,
-                    'type': 'SELL',
-                    'price': current_price,
-                    'amount': btc_balance[i-1],
-                    'value': usd_value
-                })
-        
-        # Calculate portfolio value
-        portfolio_values[i] = usd_balance[i] + (btc_balance[i] * current_price)
-    
-    # Calculate performance metrics
-    final_portfolio_value = portfolio_values[-1]
-    total_return = ((final_portfolio_value - initial_balance) / initial_balance) * 100
-    
-    return total_return, trades, portfolio_values
-
-# Define parameter ranges (optimized for faster testing)
-# buy_percentages = np.arange(0.97, 1.00, 0.005)  # Reduced granularity
-# sell_percentages = np.arange(1.01, 1.03, 0.005)  # Reduced granularity
-# window_sizes = np.array([3, 5, 10, 20, 30, 60, 120])  # Reduced window sizes to test
-
-buy_percentages = np.array([0.98])
-sell_percentages = np.array([1.02])
-window_sizes = np.array([60])  # Reduced window sizes to test
-time_windows = 1
-time_window_length_months = 12
-time_window_length = time_window_length_months * 60 * 60 * 24 * 30
-
-# Pre-calculate moving averages for all window sizes
-print("\nPre-calculating moving averages...")
-moving_averages = calculate_moving_averages(price_values, window_sizes)
-
-print("\nPre-calculating weighted moving averages...")
-weighted_moving_averages = calculate_weighted_moving_averages(price_values, [10 * 3600 * 24])
-
-# Initialize best results tracking
-best_results = {
-    'return': float('-inf'),
-    'buy_percent': None,
-    'sell_percent': None,
-    'window_size': None,
-    'trades': None,
-    'portfolio_values': None
-}
-
-print("\nRunning simulations with different parameters...")
-total_simulations = len(buy_percentages) * len(sell_percentages) * len(window_sizes)
-simulation_count = 0
-
-# Create a progress bar for the entire simulation
-pbar = tqdm(total=total_simulations, desc="Simulation Progress")
-
-for buy_percent in buy_percentages:
-    for sell_percent in sell_percentages:
-        if buy_percent >= sell_percent:
-            continue
-            
-        for window_size in window_sizes:
-            simulation_count += 1
-            pbar.update(1)
-            
-            sim_results = []
-            for time_window in range(time_windows):
-                start_time = 1650659523
-                end_time = 1682195523
-                time_range = end_time - start_time
-                lerp_amount = time_window / time_windows if time_windows > 1 else 0
-                selected_time = start_time + (time_range * lerp_amount)
-                total_return, trades, portfolio_values = run_simulation(
-                    buy_percent, sell_percent, window_size, moving_averages, weighted_moving_averages, selected_time, selected_time + time_window_length
-                )
-                sim_results.append((total_return, trades, portfolio_values))
-            
-            returns, trades_list, portfolio_values_list = zip(*sim_results)
-            total_return = sum(returns) / len(returns)
-            trade_avg = sum([len(t) for t in trades_list]) / len(trades_list)
-            
-            # Instead of averaging portfolio values, we'll use the last simulation's values
-            portfolio_values = portfolio_values_list[-1]  # Use the last simulation's values
-
-            if total_return > best_results['return']:
-                best_results.update({
-                    'return': total_return,
-                    'buy_percent': buy_percent,
-                    'sell_percent': sell_percent,
-                    'window_size': window_size,
-                    'trades': trade_avg,
-                    'portfolio_values': portfolio_values
-                })
-                
-            pbar.set_postfix({
-                'Buy': f"{buy_percent:.2f}", 
-                'Sell': f"{sell_percent:.2f}", 
-                'Window': window_size, 
-                'Return': f"{total_return:.2f}%"
+        if current_price <= buy_prices[i] and usd_balances[i-1] > 0:
+            usd_balances[i], btc_balances[i] = buy(usd_balances[i-1], btc_balances[i-1], current_price, fee_percent, real)
+            last_purchase_price = current_price * floor
+            fee_amount = usd_balances[i-1] * fee_percent
+            total_fees += fee_amount
+            trades.append({
+                'datetime': current_date,
+                'price': current_price,
+                'usd_balance': usd_balances[i],
+                'btc_balance': btc_balances[i],
+                'trade': 'BUY',
+                'ma': df.iloc[i]['moving_average_60'],
+                'fee': fee_amount
             })
+        # Sell decision
+        elif current_price >= sell_prices[i] and current_price > last_purchase_price and btc_balances[i-1] > 0:
+            usd_balances[i], btc_balances[i] = sell(usd_balances[i-1], btc_balances[i-1], current_price, fee_percent, real)
+            fee_amount = btc_balances[i-1] * current_price * fee_percent
+            total_fees += fee_amount
+            trades.append({
+                'datetime': current_date,
+                'price': current_price,
+                'usd_balance': usd_balances[i],
+                'btc_balance': btc_balances[i],
+                'trade': 'SELL',
+                'ma': df.iloc[i]['moving_average_60'],
+                'fee': fee_amount
+            })
+        else:
+            usd_balances[i] = usd_balances[i-1]
+            btc_balances[i] = btc_balances[i-1]
+        
+        # Update portfolio value
+        portfolio_values[i] = usd_balances[i] + (btc_balances[i] * current_price)
+    
+    if verbose:
+        # Create the plot
+        plt.figure(figsize=(12, 6))
+        plt.style.use('classic')
+        
+        # Set white background
+        plt.rcParams['figure.facecolor'] = 'white'
+        plt.rcParams['axes.facecolor'] = 'white'
+        
+        # Plot the price line
+        plt.plot(df['datetime'], df['close'], label='BTC Price', color='blue')
+        
+        # Plot moving averages
+        plt.plot(df['datetime'], df['moving_average_60'], 
+                label='60-minute MA', color='purple', linestyle='--')
+        
+        # Plot buy and sell points
+        buy_points = [(t['datetime'], t['price']) for t in trades if t['trade'] == 'BUY']
+        sell_points = [(t['datetime'], t['price']) for t in trades if t['trade'] == 'SELL']
+        
+        if buy_points:
+            dates, prices = zip(*buy_points)
+            plt.scatter(dates, prices, marker='^', color='green', s=100, label='Buy')
+        
+        if sell_points:
+            dates, prices = zip(*sell_points)
+            plt.scatter(dates, prices, marker='v', color='red', s=100, label='Sell')
+        
+        plt.title('BTC Price with Buy/Sell Points and Moving Averages')
+        plt.xlabel('Date')
+        plt.ylabel('Price (USD)')
+        
+        # Improve grid appearance
+        plt.grid(True, linestyle='--', alpha=0.7)
+        
+        # Format x-axis
+        plt.gcf().autofmt_xdate()
+        
+        # Remove duplicate labels
+        handles, labels = plt.gca().get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        plt.legend(by_label.values(), by_label.keys())
+        
+        plt.tight_layout()
+    
+    # Calculate final profit
+    initial_value = usd_balance + (btc_balance * df.iloc[0]['close'])
+    
+    # Find last sell trade
+    last_sell = next((trade for trade in reversed(trades) if trade['trade'] == 'SELL'), None)
+    last_sell_value = last_sell['usd_balance'] if last_sell else portfolio_values[-1]
+    last_sell_profit = last_sell_value - initial_value
+    
+    # Calculate final portfolio value profit
+    final_portfolio_value = portfolio_values[-1]
+    final_portfolio_profit = final_portfolio_value - initial_value
+    
+    # Calculate ROIs
+    roi_with_trades = (final_portfolio_profit / initial_value) * 100
+    roi_without_trades = ((df.iloc[-1]['close'] - df.iloc[0]['close']) / df.iloc[0]['close']) * 100
+    
+    if verbose:
+        print(f"Number of trades: {len(trades)}")
+        print(f"Total fees paid: ${total_fees:.2f}")
+        print(f"Profit based on last sell: ${last_sell_profit:.2f}")
+        print(f"Profit based on final portfolio: ${final_portfolio_profit:.2f}")
+        print(f"ROI with trades: {roi_with_trades:.2f}%")
+        print(f"ROI without trades (just holding): {roi_without_trades:.2f}%")
+        print(f"Final portfolio value: ${final_portfolio_value:.2f}")
+        print(f"Final BTC balance: {btc_balances[-1]:.8f}")
+        print(f"Final USD balance: ${usd_balances[-1]:.2f}")
+        
+        try:
+            plt.show()
+        except KeyboardInterrupt:
+            pass
+        plt.close()
+    
+    return trades, last_sell_value
 
-pbar.close()
+if __name__ == '__main__':
+    usd_balance = 100000
+    btc_balance = 0
+    initial_value = usd_balance
 
-# Print best results
-print("\nBest Performance:")
-print(f"Buy Percentage: {best_results['buy_percent']:.2f}")
-print(f"Sell Percentage: {best_results['sell_percent']:.2f}")
-print(f"Window Size: {best_results['window_size']}")
-print(f"Total Return: {best_results['return']:.2f}%")
-print(f"Total Return 12 Months: {best_results['return'] * (12 / time_window_length_months):.2f}%")
-print(f"Number of Trades: {(best_results['trades'])}")
+    current_time = datetime(2022, 1, 1)
+    start_date = current_time - timedelta(days=2 * 365)
+    end_date = current_time
+    get_data(start_date, end_date)
+    
+    # Using 0.5% trading fee (0.005)
+    best_buy_percent = 0
+    best_sell_percent = 0
+    best_floor = 0
+    best_last_sell_value = 0
+    for buy_percent in np.arange(0.98, 1.02, 0.01):
+        for sell_percent in np.arange(0.98, 1.02, 0.01):
+            for floor in np.arange(0.98, 1.02, 0.01):
+                trades, last_sell_value = simulate(usd_balance, btc_balance, start_date, end_date, buy_percent, sell_percent, floor, 0.005)
+                if last_sell_value > best_last_sell_value:
+                    best_buy_percent = buy_percent
+                    best_sell_percent = sell_percent
+                    best_floor = floor
+                    best_last_sell_value = last_sell_value
+                print(f"Buy percent: {buy_percent}, Sell percent: {sell_percent}, Floor: {floor}, Last sell value: {last_sell_value}")
+    print(f"Best buy percent: {best_buy_percent}, Best sell percent: {best_sell_percent}, Best floor: {best_floor}, Best last sell value: {best_last_sell_value}")
 
-print(dates.shape)
 
-# Visualize results
-plt.figure(figsize=(12, 8))
-plt.plot(dates, price_values, label='BTC Price', alpha=0.5)
+    # current_time = datetime.now()
+    # start_date = current_time - timedelta(days=365)
+    # end_date = current_time
+    # get_data(start_date, end_date)
 
-# Add buy and sell markers
-buy_dates = [trade['date'] for trade in trades if trade['type'] == 'BUY']
-buy_prices = [trade['price'] for trade in trades if trade['type'] == 'BUY']
-sell_dates = [trade['date'] for trade in trades if trade['type'] == 'SELL']
-sell_prices = [trade['price'] for trade in trades if trade['type'] == 'SELL']
-
-try:
-    # plt.plot(dates, moving_averages[window_size], label=f'{window_size}-day Moving Average', linestyle='--', color='purple')
-    # plt.plot(dates, moving_averages[window_size] * best_results["buy_percent"], label=f'Buy Line ({best_results["buy_percent"]*100:.2f}% of MA)', linestyle='--', color='green', alpha=0.7)
-    # plt.plot(dates, moving_averages[window_size] * best_results["sell_percent"], label=f'Sell Line ({best_results["sell_percent"]*100:.2f}% of MA)', linestyle='--', color='red', alpha=0.7)
-
-    plt.plot(dates, weighted_moving_averages[str(10 * 3600 * 24)], label=f'Weighted Moving Average', linestyle='--', color='purple')
-
-    plt.scatter(buy_dates, buy_prices, color='green', marker='^', s=100, label='Buy', alpha=0.7)
-    plt.scatter(sell_dates, sell_prices, color='red', marker='v', s=100, label='Sell', alpha=0.7)
-
-    plt.title('Bitcoin Trading Simulation')
-    plt.xlabel('Date')
-    plt.ylabel('Value ($)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('btc_simulation_results.png')
-    plt.show()
-
-except KeyboardInterrupt:
-    print("Simulation interrupted by user")
-
-# Print simulation results
-print("\nBitcoin Trading Simulation Results:")
-print("===================================")
-# print(f"Initial Balance: ${initial_balance:,.2f}")
-# print(f"Final Portfolio Value: ${final_portfolio_value:,.2f}")
-print(f"Total Return: {total_return:.2f}%")
-print(f"Number of Trades: {len(trades)}")
+    trades, last_sell_value = simulate(usd_balance, btc_balance, start_date, end_date, 0.99, 1.01, 0.99, 0.005, verbose=True)

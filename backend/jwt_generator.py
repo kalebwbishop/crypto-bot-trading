@@ -26,8 +26,11 @@ def build_jwt(method, path):
         "nonce": str(current_time)
     }
 
-    host = "api.coinbase.com"
-    uri = f"{method} {host}/{path}"
+    if not path.startswith("https://api.coinbase.com"):
+        raise ValueError("Path must start with https://api.coinbase.com")
+    
+    path = path.replace("https://", "")
+    uri = f"{method} {path}"
 
     data = {
         "iss": "coinbase-cloud",

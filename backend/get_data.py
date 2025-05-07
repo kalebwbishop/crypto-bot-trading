@@ -1,152 +1,102 @@
-import requests
-import csv
-import time
-import os
-import logging
-import pandas as pd
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from datetime import datetime
-from jwt_generator import build_jwt
-from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
+import matplotlib.pyplot as plt
+import pandas as pd
+import os
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+def get_data(start_date: datetime, end_date: datetime):
+    def calculate_moving_averages(df):
+        window_sizes = [10, 20, 50, 60, 100, 200]
+        # Sort by datetime to ensure correct calculation
+        df = df.sort_values(by='datetime')
+        for window_size in window_sizes:
+            df[f'moving_average_{window_size}'] = df['close'].rolling(window=window_size).mean()
+        return df
 
-# Configure retry strategy
-retry_strategy = Retry(
-    total=3,  # number of retries
-    backoff_factor=1,  # wait 1, 2, 4 seconds between retries
-    status_forcelist=[429, 500, 502, 503, 504]  # HTTP status codes to retry on
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
-session = requests.Session()
-session.mount("https://", adapter)
-session.mount("http://", adapter)
+    # Convert string dates to datetime if they're strings
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, '%Y-%m-%d')
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, '%Y-%m-%d')
 
-def get_data(symbol, start_epoch, granularity="ONE_MINUTE", rate_limit_delay=0.5):
-    """
-    Fetch historical candle data for a given symbol.
-    
-    Args:
-        symbol (str): Trading pair symbol (e.g., 'BTC-USD')
-        start_epoch (int): Start time in epoch seconds
-        granularity (str): Candle timeframe (default: 'ONE_MINUTE')
-        rate_limit_delay (float): Delay between API calls in seconds (default: 0.5)
-    
-    Returns:
-        tuple: (bool, pd.DataFrame) - Success status and DataFrame containing the data
-    """
-    data_file = f"{symbol.replace('-', '_').replace('^', '')}.csv"
-    
-    try:
-        # Initialize or read existing file
-        existing_data = {}
-        if os.path.exists(data_file) and os.path.getsize(data_file) > 0:
-            with open(data_file, "r") as f:
-                reader = csv.reader(f)
-                next(reader)  # Skip header
-                for row in reader:
-                    if row and len(row) > 0:
-                        timestamp = int(row[0])
-                        existing_data[timestamp] = row
-                if existing_data:
-                    # Find the most recent timestamp
-                    start_epoch = max(existing_data.keys())
-                    logger.info(f"Resuming from timestamp: {datetime.fromtimestamp(start_epoch)}")
-        else:
-            # Create new file with header
-            with open(data_file, "w") as f:
-                writer = csv.writer(f)
-                writer.writerow(["start", "open", "high", "low", "close", "volume"])
-
-        end_epoch = int(time.time()) - 60
-        jwt = build_jwt("GET", f"api/v3/brokerage/products/{symbol}/candles")
+    # Check if CSV exists and read it
+    csv_path = 'BTC_USD.csv'
+    if os.path.exists(csv_path):
+        existing_df = pd.read_csv(csv_path)
+        existing_df['datetime'] = pd.to_datetime(existing_df['datetime'])
         
-        while start_epoch < end_epoch:
-            url = f"https://api.coinbase.com/api/v3/brokerage/products/{symbol}/candles"
-            params = {
-                "start": start_epoch,
-                "granularity": granularity
-            }
-            
-            try:
-                response = session.get(
-                    url,
-                    params=params,
-                    headers={"Authorization": f"Bearer {jwt}"},
-                    timeout=10
-                )
-
-                if response.status_code == 401:
-                    # If unauthorized, rebuild JWT and retry
-                    jwt = build_jwt("GET", f"api/v3/brokerage/products/{symbol}/candles")
-                    continue
-                
-                response.raise_for_status()
-                
-                data = response.json().get("candles")
-                if not data:
-                    logger.info(f"No more data available for {symbol}")
-                    break
-                
-                data.reverse()
-                
-                # Filter out duplicates and prepare new data
-                new_data = []
-                for d in data:
-                    timestamp = int(d['start'])
-                    if timestamp not in existing_data:
-                        new_data.append([timestamp, d['open'], d['high'], d['low'], d['close'], d['volume']])
-                        existing_data[timestamp] = [timestamp, d['open'], d['high'], d['low'], d['close'], d['volume']]
-                
-                # Only write if we have new data
-                if new_data:
-                    with open(data_file, "a") as f:
-                        writer = csv.writer(f)
-                        writer.writerows(new_data)
-                    logger.info(f"Added {len(new_data)} new data points for {symbol}")
-                
-                new_start_epoch = int(data[-1]['start'])
-                if new_start_epoch <= start_epoch:
-                    logger.info(f"No new data available for {symbol}")
-                    break
-                
-                start_epoch = new_start_epoch
-                end_epoch = int(time.time()) - 60
-                
-                logger.info(f"Processed data for {symbol} up to {datetime.fromtimestamp(start_epoch)}")
-                time.sleep(rate_limit_delay)  # Rate limiting
-                
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error fetching data for {symbol}: {str(e)}")
-                return False, None
-            except (KeyError, ValueError, IndexError) as e:
-                logger.error(f"Error processing data for {symbol}: {str(e)}")
-                return False, None
-            
-        # Read the CSV file into a pandas DataFrame
-        if os.path.exists(data_file) and os.path.getsize(data_file) > 0:
-            df = pd.read_csv(data_file)
-            # Convert timestamp to datetime
-            df['start'] = pd.to_datetime(df['start'], unit='s')
-            return True, df
-        else:
-            return True, pd.DataFrame(columns=["start", "open", "high", "low", "close", "volume"])
+        # Check if we have all the data we need
+        if (existing_df['datetime'].min() <= start_date and 
+            existing_df['datetime'].max() >= end_date):
+            # We have all the data we need
+            mask = (existing_df['datetime'] >= start_date) & (existing_df['datetime'] <= end_date)
+            return existing_df[mask]
         
-    except Exception as e:
-        logger.error(f"Unexpected error for {symbol}: {str(e)}")
-        return False, None
+        # If we need more recent data, only fetch from the last available date
+        if existing_df['datetime'].max() < end_date:
+            fetch_start = existing_df['datetime'].max()
+            fetch_end = end_date
+        else:
+            # If we need older data, fetch from start_date to the earliest available date
+            fetch_start = start_date
+            fetch_end = existing_df['datetime'].min()
+    else:
+        # If no CSV exists, fetch the entire range
+        fetch_start = start_date
+        fetch_end = end_date
+        existing_df = None
+
+    # Fetch new data from Alpaca
+    client = CryptoHistoricalDataClient()
+
+    # Creating request object
+    request_params = CryptoBarsRequest(
+        symbol_or_symbols=["BTC/USD"],
+        timeframe=TimeFrame.Minute,
+        start=fetch_start,
+        end=fetch_end
+    )
+
+    # Retrieve daily bars for Bitcoin in a DataFrame
+    btc_bars = client.get_crypto_bars(request_params)
+
+    # Convert to dataframe
+    df = btc_bars.df
+
+    # Add epoch timestamp column by accessing the timestamp from the index
+    df['datetime'] = pd.to_datetime(df.index.get_level_values('timestamp').astype('int64') // 10**9, unit='s')
+
+    # Drop the unneeded columns
+    df = df.drop(columns=['open', 'high', 'low', 'volume', 'trade_count', 'vwap'])
+
+    # Sort by epoch
+    df = df.sort_values(by='datetime')
+
+    # If we have existing data, merge with it
+    if existing_df is not None:
+        # Combine old and new data, removing duplicates
+        combined_df = pd.concat([existing_df, df])
+        combined_df = combined_df.drop_duplicates(subset=['datetime'])
+        combined_df = combined_df.sort_values(by='datetime')
+        
+        # Recalculate moving averages for the entire dataset
+        combined_df = calculate_moving_averages(combined_df)
+        
+        # Save the combined data
+        combined_df.to_csv(csv_path, index=False)
+        
+        # Return only the requested date range
+        mask = (combined_df['datetime'] >= start_date) & (combined_df['datetime'] <= end_date)
+        return combined_df[mask]
+    else:
+        # Calculate moving averages for new data
+        df = calculate_moving_averages(df)
+        
+        # Save new data
+        df.to_csv(csv_path, index=False)
+        return df
 
 if __name__ == "__main__":
-    one_year_ago = int(1682195523) - 3600 * 24 * 365
-    success, df = get_data("BTC-USD", start_epoch=one_year_ago)
-    if success:
-        logger.info("Data collection completed successfully")
-        print(f"Collected {len(df)} data points")
-    else:
-        logger.error("Data collection failed")
-        
+    get_data('2020-01-01', '2023-01-01')
